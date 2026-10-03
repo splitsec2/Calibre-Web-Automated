@@ -51,7 +51,11 @@ def fetch_and_apply_metadata(book_id: int, user_enabled: bool = False) -> bool:
         if book.authors:
             author_names = [author.name for author in book.authors]
             search_query += " " + " ".join(author_names)
-            
+
+        # The book's existing ISBN is used to pick the matching edition from the
+        # provider's results instead of blindly taking the first one (NextGen #402).
+        book_isbn = _book_isbn(book)
+
         log.info(f"Fetching metadata for: {search_query}")
         
         # Get provider hierarchy
@@ -91,8 +95,9 @@ def fetch_and_apply_metadata(book_id: int, user_enabled: bool = False) -> bool:
                 if not results or len(results) == 0:
                     continue
                     
-                # Use the first result
-                metadata = results[0]
+                # Prefer the candidate whose ISBN matches the book's existing ISBN
+                # over a blind first result (NextGen #402).
+                metadata = _select_metadata_result(results, book_isbn)
                 
                 # Apply metadata to book
                 if _apply_metadata_to_book(book, metadata, calibre_db_instance):
@@ -143,9 +148,12 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
                 book.title = metadata.title.strip()
                 updated = True
             
-        # Update authors - only if enabled in settings
-        if (cwa_settings.get('auto_metadata_update_authors', True) and 
-            metadata.authors and len(metadata.authors) > 0):
+        # Update authors - only if enabled in settings. In smart mode, never clear
+        # an existing meaningful author (NextGen #403): a weak match must not replace a
+        # correct author with a foreign edition's translator.
+        if (cwa_settings.get('auto_metadata_update_authors', True) and
+            metadata.authors and len(metadata.authors) > 0 and
+            not (use_smart_application and _has_meaningful_authors(book))):
             # Clear existing authors
             book.authors.clear()
             for author_name in metadata.authors:
@@ -211,9 +219,11 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
                         book.tags.append(tag)
             updated = True
             
-        # Update series if available and enabled in settings
-        if (cwa_settings.get('auto_metadata_update_series', True) and 
-            hasattr(metadata, 'series') and metadata.series and metadata.series.strip()):
+        # Update series if available and enabled in settings. Smart mode keeps an
+        # existing series rather than overwriting it (NextGen #403).
+        if (cwa_settings.get('auto_metadata_update_series', True) and
+            hasattr(metadata, 'series') and metadata.series and metadata.series.strip() and
+            not (use_smart_application and book.series)):
             series = calibre_db_instance.get_series_by_name(metadata.series.strip())
             if not series:
                 series = db.Series(metadata.series.strip(), metadata.series.strip())
@@ -231,9 +241,11 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
                     book.series_index = '1.0'
             updated = True
             
-        # Update published date if available and enabled in settings
-        if (cwa_settings.get('auto_metadata_update_published_date', True) and 
-            hasattr(metadata, 'publishedDate') and metadata.publishedDate):
+        # Update published date if available and enabled in settings. Smart mode
+        # keeps an existing publication date (NextGen #403).
+        if (cwa_settings.get('auto_metadata_update_published_date', True) and
+            hasattr(metadata, 'publishedDate') and metadata.publishedDate and
+            not (use_smart_application and _has_pubdate(book))):
             try:
                 from datetime import datetime
                 if isinstance(metadata.publishedDate, str):
@@ -251,9 +263,11 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
             except Exception as e:
                 log.warning(f"Error parsing published date: {e}")
                 
-        # Update rating if available and enabled in settings
-        if (cwa_settings.get('auto_metadata_update_rating', True) and 
-            hasattr(metadata, 'rating') and metadata.rating):
+        # Update rating if available and enabled in settings. Smart mode keeps an
+        # existing rating (NextGen #403).
+        if (cwa_settings.get('auto_metadata_update_rating', True) and
+            hasattr(metadata, 'rating') and metadata.rating and
+            not (use_smart_application and book.ratings)):
             try:
                 rating_value = float(metadata.rating)
                 if 0 <= rating_value <= 10:  # Calibre uses 0-10 scale
@@ -267,8 +281,10 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
             except (ValueError, TypeError):
                 pass
                 
-        # Update identifiers if available and enabled in settings
-        if (cwa_settings.get('auto_metadata_update_identifiers', True) and 
+        # Update identifiers if available and enabled in settings. Smart mode fills
+        # in identifier types the book is missing but never overwrites an existing
+        # value, so a correct ISBN is not clobbered by a foreign edition's (NextGen #403).
+        if (cwa_settings.get('auto_metadata_update_identifiers', True) and
             hasattr(metadata, 'identifiers') and metadata.identifiers):
             for identifier_type, identifier_value in metadata.identifiers.items():
                 if identifier_type and identifier_value:
@@ -276,14 +292,16 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
                     existing = False
                     for identifier in book.identifiers:
                         if identifier.type == identifier_type:
-                            identifier.val = identifier_value
+                            if not use_smart_application:
+                                identifier.val = identifier_value
+                                updated = True
                             existing = True
                             break
                     if not existing:
                         new_identifier = db.Identifiers(identifier_value, identifier_type, book.id)
                         calibre_db_instance.session.add(new_identifier)
                         book.identifiers.append(new_identifier)
-                    updated = True
+                        updated = True
         
         # Handle cover image - only if enabled in settings
         if (cwa_settings.get('auto_metadata_update_cover', True) and 
@@ -303,6 +321,53 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
         log.error(f"Error applying metadata to book {getattr(book, 'id', 'unknown')}: {e}")
         calibre_db_instance.session.rollback()
         return False
+
+
+def _normalize_isbn(value):
+    """Strip separators and upper-case so ISBNs compare regardless of formatting."""
+    return "".join(ch for ch in str(value) if ch.isalnum()).upper()
+
+
+def _book_isbn(book):
+    """Return the book's existing ISBN (preferring ISBN-13) or None (NextGen #402)."""
+    isbn13 = isbn = None
+    for ident in (getattr(book, "identifiers", None) or []):
+        itype = (getattr(ident, "type", "") or "").lower()
+        if itype in ("isbn13", "isbn_13"):
+            isbn13 = ident.val
+        elif itype == "isbn":
+            isbn = ident.val
+    return isbn13 or isbn
+
+
+def _select_metadata_result(results, book_isbn):
+    """Pick the candidate whose ISBN matches the book's existing ISBN, else the
+    first result (NextGen #402). Prevents a blind ``results[0]`` from applying a wrong
+    foreign edition over a book that already carries a correct ISBN."""
+    if book_isbn:
+        target = _normalize_isbn(book_isbn)
+        for result in results:
+            identifiers = getattr(result, "identifiers", None) or {}
+            for key in ("isbn", "isbn13", "isbn_13", "isbn10"):
+                candidate = identifiers.get(key)
+                if candidate and _normalize_isbn(candidate) == target:
+                    return result
+    return results[0]
+
+
+def _has_meaningful_authors(book):
+    """True if the book already has a real author (not empty / not the Calibre
+    'Unknown' placeholder), so smart mode won't overwrite it (NextGen #403)."""
+    authors = getattr(book, "authors", None) or []
+    return any((getattr(a, "name", "") or "").strip().lower() not in ("", "unknown")
+               for a in authors)
+
+
+def _has_pubdate(book):
+    """True if the book already has a real publication date (not the Calibre
+    'undefined' sentinel year 101), so smart mode won't overwrite it (NextGen #403)."""
+    pubdate = getattr(book, "pubdate", None)
+    return bool(pubdate) and getattr(pubdate, "year", 0) > 101
 
 
 def _parse_metadata_providers_enabled(raw_value):
