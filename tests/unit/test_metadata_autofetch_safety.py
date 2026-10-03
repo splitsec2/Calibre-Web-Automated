@@ -202,5 +202,53 @@ class TestSmartModeGuards:
         assert [a.name for a in book.authors] == ["New Author"]
 
 
+# --- smart mode keeps an existing title and description (not from NextGen) ---
+
+class TestSmartModeKeepsTitleAndDescription:
+    """Smart mode used to take the longer title and description. A summary's
+    title ("Summary of The Selfish Gene ...") and its "This is NOT the original
+    book" disclaimer are both longer than the real book's."""
+
+    def test_existing_title_preserved_in_smart_mode(self, monkeypatch):
+        _patch_settings(monkeypatch, auto_metadata_smart_application=True)
+        book = _Book()
+        book.title = "The Selfish Gene"
+        m._apply_metadata_to_book(
+            book, _meta(title="Summary of The Selfish Gene 40th Anniversary Edition"), _FakeCDB())
+        assert book.title == "The Selfish Gene"
+
+    @pytest.mark.parametrize("placeholder", ["", "Unknown"])
+    def test_missing_title_filled_in_smart_mode(self, monkeypatch, placeholder):
+        _patch_settings(monkeypatch, auto_metadata_smart_application=True)
+        book = _Book()
+        book.title = placeholder
+        m._apply_metadata_to_book(book, _meta(title="The Selfish Gene"), _FakeCDB())
+        assert book.title == "The Selfish Gene"
+
+    def test_existing_description_preserved_in_smart_mode(self, monkeypatch):
+        from types import SimpleNamespace as NS
+        _patch_settings(monkeypatch, auto_metadata_smart_application=True)
+        book = _Book()
+        book.comments.append(NS(text="Short blurb."))
+        m._apply_metadata_to_book(
+            book, _meta(description="Disclaimer: This is NOT the original book. " * 5), _FakeCDB())
+        assert book.comments[0].text == "Short blurb."
+
+    def test_missing_description_filled_in_smart_mode(self, monkeypatch):
+        from types import SimpleNamespace as NS
+        _patch_settings(monkeypatch, auto_metadata_smart_application=True)
+        book = _Book()
+        book.comments.append(NS(text="   "))
+        m._apply_metadata_to_book(book, _meta(description="The real blurb."), _FakeCDB())
+        assert book.comments[0].text == "The real blurb."
+
+    def test_normal_mode_still_overwrites_title(self, monkeypatch):
+        _patch_settings(monkeypatch, auto_metadata_smart_application=False)
+        book = _Book()
+        book.title = "Old Title"
+        m._apply_metadata_to_book(book, _meta(title="New"), _FakeCDB())
+        assert book.title == "New"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
