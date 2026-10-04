@@ -6,11 +6,14 @@
 # See CONTRIBUTORS for full list of authors.
 
 import json
+import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
 
 from cps import logger, db
+from cps import book_evidence
+from cps import metadata_match
 from cps.search_metadata import cl as metadata_providers
 import sys
 sys.path.insert(1, '/app/calibre-web-automated/scripts/')
@@ -59,6 +62,24 @@ def fetch_and_apply_metadata(book_id: int, user_enabled: bool = False) -> bool:
         # provider's results instead of blindly taking the first one (NextGen #402).
         book_isbn = _book_isbn(book)
 
+        # Read the EPUB once. Every provider's results are checked against what
+        # the book itself prints (title page, copyright page, labelled ISBNs).
+        # Other formats, and image-only EPUBs, keep the title/author gate alone.
+        evidence_mode, evidence, evidence_reason = _read_book_evidence(book)
+        if evidence_mode == "skip":
+            log.info(f"Not applying fetched metadata to book: {book.title}: {evidence_reason}")
+            calibre_db_instance.session.close()
+            return False
+        if evidence_mode == "gate":
+            log.debug(f"In-book check not used for {book.title}: {evidence_reason}")
+        elif _is_junk_title(book.title):
+            # An import titled with its own ISBN ("0062288431 (N)") can't be found
+            # by its title. Search for the ISBN printed on its copyright page;
+            # a result is still only applied if the book proves it.
+            printed = _printed_isbns(evidence)
+            if printed:
+                search_query = printed[0]
+
         log.info(f"Fetching metadata for: {search_query}")
         
         # Get provider hierarchy
@@ -100,11 +121,18 @@ def fetch_and_apply_metadata(book_id: int, user_enabled: bool = False) -> bool:
                     
                 # Prefer the candidate whose ISBN matches the book's existing ISBN
                 # over a blind first result (NextGen #402), and refuse a candidate
-                # that isn't plausibly this book at all (NextGen #1164).
-                metadata = _select_metadata_result(
-                    results, book_isbn,
-                    book_title=book.title, book_authors=book.authors,
-                )
+                # that isn't plausibly this book at all (NextGen #1164). With an
+                # EPUB, the candidate must also be what the book prints.
+                if evidence_mode == "evidence":
+                    metadata = _select_with_book_evidence(
+                        results, evidence, book_isbn,
+                        book_title=book.title, book_authors=book.authors,
+                    )
+                else:
+                    metadata = _select_metadata_result(
+                        results, book_isbn,
+                        book_title=book.title, book_authors=book.authors,
+                    )
                 if metadata is None:
                     log.info(
                         f"No confident match from {provider.__name__} for book: "
@@ -118,7 +146,10 @@ def fetch_and_apply_metadata(book_id: int, user_enabled: bool = False) -> bool:
                 searched_title = book.title
 
                 # Apply metadata to book
-                if _apply_metadata_to_book(book, metadata, calibre_db_instance):
+                # A junk title (an ISBN, a format marker) is only replaced when
+                # the book printed the new one, which the in-book check requires.
+                if _apply_metadata_to_book(book, metadata, calibre_db_instance,
+                                           replace_junk_title=evidence_mode == "evidence"):
                     log.info(f"Successfully applied metadata from {provider.__name__} for book: {searched_title}")
                     metadata_found = True
                     break
@@ -135,7 +166,7 @@ def fetch_and_apply_metadata(book_id: int, user_enabled: bool = False) -> bool:
         return False
 
 
-def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
+def _apply_metadata_to_book(book, metadata, calibre_db_instance, replace_junk_title=False) -> bool:
     """
     Apply fetched metadata to a book record.
     
@@ -143,6 +174,9 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
         book: The book database record
         metadata: The metadata record from provider
         calibre_db_instance: Database instance
+        replace_junk_title: smart mode also replaces a title that is an ISBN or
+            a file name ("0062288431 (N)"); only set when the book file printed
+            the new title
         
     Returns:
         bool: True if metadata was successfully applied
@@ -161,7 +195,7 @@ def _apply_metadata_to_book(book, metadata, calibre_db_instance) -> bool:
         if (cwa_settings.get('auto_metadata_update_title', True) and 
             metadata.title and metadata.title.strip()):
             if use_smart_application:
-                if not _has_meaningful_title(book):
+                if not _has_meaningful_title(book) or (replace_junk_title and _is_junk_title(book.title)):
                     book.title = metadata.title.strip()
                     updated = True
             else:
@@ -597,6 +631,212 @@ def _select_metadata_result(results, book_isbn, book_title=None, book_authors=No
         return None
 
     return best
+
+
+# --- In-book check ---------------------------------------------------------
+#
+# The gate above compares a provider result with the book's database record. On
+# a fresh ingest that record is whatever the EPUB's own metadata said, which can
+# be junk ("0062288431 (N)", a "Die Trying (txt)" author), and a summary record
+# that lists the original author passes it. These compare the result with the
+# text of the book instead: its title page, its copyright page and the ISBNs
+# printed there. The rules are in cps/metadata_match.py and the EPUB reader in
+# cps/book_evidence.py, both stdlib only.
+
+_EVIDENCE_FORMATS = ("EPUB", "KEPUB")
+# Only the first few results are named in the log when nothing is applied.
+_LOGGED_REJECTIONS = 3
+
+
+def _library_roots():
+    """Directories the book's relative path may sit under, most specific first."""
+    roots = []
+    try:
+        from cps import config as cps_config
+        try:
+            roots.append(cps_config.get_book_path())
+        except Exception:
+            pass
+        roots.append(getattr(cps_config, "config_calibre_dir", None))
+    except Exception:
+        pass
+    roots.append(getattr(getattr(db.CalibreDB, "config", None), "config_calibre_dir", None))
+    out = []
+    for root in roots:
+        if root and isinstance(root, str) and root not in out:
+            out.append(root)
+    return out
+
+
+def _book_epub_path(book):
+    """(path, "") for the book's EPUB in the library, or (None, why not)."""
+    data = list(getattr(book, "data", None) or [])
+    for fmt in _EVIDENCE_FORMATS:
+        for entry in data:
+            if (getattr(entry, "format", "") or "").upper() != fmt:
+                continue
+            rel = os.path.join(getattr(book, "path", "") or "", "%s.%s" % (entry.name, fmt.lower()))
+            for root in _library_roots():
+                full = os.path.join(root, rel)
+                if os.path.isfile(full):
+                    return full, ""
+            return None, "its %s was not found in the library (%s)" % (fmt, rel)
+    formats = sorted({(getattr(e, "format", "") or "").upper() for e in data})
+    return None, "no EPUB to read (formats: %s)" % (", ".join(formats) or "none")
+
+
+def _read_book_evidence(book):
+    """Read the book file once, before any provider is asked.
+
+    Returns (mode, evidence, reason):
+      "evidence": check every result against ``evidence``
+      "gate":     no EPUB (or an image-only one): the title/author gate alone,
+                  exactly as before
+      "skip":     the EPUB is there but can't be read, or the check failed:
+                  apply nothing
+    """
+    try:
+        path, why = _book_epub_path(book)
+        if not path:
+            return "gate", None, why
+        evidence = book_evidence.extract(path)
+        if evidence.get("status") != "ok":
+            return "skip", None, "its EPUB could not be read (%s), so nothing can be checked" % evidence.get("reason")
+        words = evidence.get("words") or 0
+        if words < metadata_match.MIN_WORDS_TO_JUDGE:
+            return "gate", None, "its EPUB has %d words of text (image-based?)" % words
+        return "evidence", evidence, ""
+    except Exception as e:
+        log.warning(f"In-book check failed for book {getattr(book, 'id', '?')}: {e}")
+        return "skip", None, "the in-book check failed (%s)" % e
+
+
+def _printed_isbns(evidence):
+    """ISBNs printed next to an ISBN label in the front matter or on a
+    copyright page, checksum-valid. ISBNs further into the body (ads for other
+    books) don't count."""
+    return [i["isbn"] for i in (evidence.get("isbns_in_text") or []) if i.get("where") != "body"]
+
+
+_ISBN_IN_TITLE = re.compile(r"\b\d{9}[\dXx]\b|\b97[89]\d{10}\b")
+
+
+def _is_junk_title(title):
+    """A title that is an ISBN or carries a file-format / download-site marker."""
+    text = (title or "").strip()
+    if not text:
+        return False
+    if book_evidence.normalize_isbn(re.sub(r"\(.*?\)|\[.*?\]", "", text)):
+        return True
+    return bool(_ISBN_IN_TITLE.search(text) or metadata_match._FORMAT_JUNK.search(text))
+
+
+def _candidate_from_result(result):
+    """The plain dict metadata_match works on, from a provider's MetaRecord."""
+    isbns = []
+    for key, value in (getattr(result, "identifiers", None) or {}).items():
+        if str(key).lower().replace("-", "").replace("_", "").startswith("isbn"):
+            isbn = book_evidence.normalize_isbn(value)
+            if isbn and isbn not in isbns:
+                isbns.append(isbn)
+    authors = getattr(result, "authors", None) or []
+    if isinstance(authors, str):
+        authors = [authors]
+    publisher = getattr(result, "publisher", None)
+    return {
+        "title": (getattr(result, "title", "") or "").strip(),
+        "subtitle": "",
+        "authors": [a.strip() for a in authors if a and str(a).strip()],
+        "publishers": [publisher] if publisher else [],
+        "isbns": isbns,
+        "pages": None,
+        "source": getattr(getattr(result, "source", None), "id", ""),
+    }
+
+
+def _description_vetoes(description):
+    """A summary product's record, whatever its title and author say."""
+    text = (description or "")[:4000]
+    out = ["description says %r" % d["phrase"]
+           for d in book_evidence.find_disclaimers(text, 4000) if d["strength"] == "strong"]
+    return out + ["description: " + r for r in metadata_match.junk_name_reasons([text])]
+
+
+def _select_with_book_evidence(results, evidence, book_isbn, book_title=None, book_authors=None):
+    """Pick the result that the book file itself backs, or None.
+
+    A result is applied only when all of these hold:
+
+    - nothing in it contradicts the book (``metadata_match.assess_candidate``:
+      summary/guide/compilation titles, known summary publishers, an author
+      the book never prints, a different volume number, a book that is itself
+      a summary), and its description is not a summary's disclaimer
+    - its title is printed in the book's front matter or copyright page, and
+      one of its authors is printed there in full
+    - it passes the title/author gate against the book's record (NextGen
+      #1164), unless the book proves it: one of its ISBNs is printed with an
+      ISBN label on the title or copyright pages. That is what lets an import
+      titled "0062288431 (N)" take the record for the book it is.
+
+    Every result is checked, then the survivors are ranked by how much of the
+    book backs them, so a wrong record ranked first by the provider no longer
+    hides a right one further down. If the two best survivors are different
+    works and neither is clearly better, nothing is applied.
+    """
+    printed = set(_printed_isbns(evidence))
+    target = book_evidence.normalize_isbn(book_isbn) if book_isbn else None
+    if target and printed and target not in printed:
+        # The record's ISBN came from the file's own metadata. The book prints
+        # others, so this one doesn't get the ISBN shortcut.
+        log.info(
+            "ISBN %s of %r is not one the book prints (%s); not matching on it",
+            target, book_title, ", ".join(sorted(printed)),
+        )
+        target = None
+
+    ranked = []
+    for index, result in enumerate(results):
+        cand = _candidate_from_result(result)
+        score, vetoes, _ = metadata_match.assess_candidate(evidence, cand)
+        vetoes = list(vetoes) + _description_vetoes(getattr(result, "description", ""))
+        if metadata_match.title_support(cand["title"], evidence) < metadata_match.PRINTED:
+            vetoes.append("title %r is not printed in the book" % cand["title"])
+        if metadata_match.author_support(cand["authors"], evidence) < 1.0:
+            vetoes.append("no author of %s is printed in full in the book" % (cand["authors"][:3],))
+        proven = bool(printed & set(cand["isbns"]))
+        isbn_match = bool(target and target in cand["isbns"])
+        if not (proven or isbn_match):
+            similarity = _title_similarity(book_title, cand["title"])
+            if similarity < 1.0 and similarity < _TITLE_FUZZY_MATCH_MIN:
+                vetoes.append("title %r does not match the book's %r (%.2f)" % (cand["title"], book_title, similarity))
+            if (_author_name_tokens(book_authors) and _author_name_tokens(cand["authors"])
+                    and not _authors_agree(book_authors, cand["authors"])):
+                vetoes.append("authors %s do not match the book's" % (cand["authors"][:3],))
+        ranked.append({"result": result, "cand": cand, "score": score, "vetoes": vetoes, "index": index})
+
+    alive = sorted((r for r in ranked if not r["vetoes"]), key=lambda r: (-r["score"], r["index"]))
+    if not alive:
+        for r in ranked[:_LOGGED_REJECTIONS]:
+            log.info("Rejected metadata %r for %r: %s", r["cand"]["title"], book_title, "; ".join(r["vetoes"][:2]))
+        return None
+
+    best = alive[0]
+    others = [r for r in alive[1:]
+              if metadata_match.title_key(r["cand"]["title"]) != metadata_match.title_key(best["cand"]["title"])
+              or not metadata_match.authors_agree(r["cand"]["authors"], best["cand"]["authors"])]
+    if others and best["score"] - others[0]["score"] < metadata_match.MARGIN:
+        log.info(
+            "Rejected metadata for %r: the book backs %r and %r about equally, applying nothing",
+            book_title, best["cand"]["title"], others[0]["cand"]["title"],
+        )
+        return None
+
+    log.info(
+        "Book file backs %r by %s for %r (score %.2f%s)",
+        best["cand"]["title"], ", ".join(best["cand"]["authors"][:3]), book_title, best["score"],
+        ", ISBN printed in the book" if printed & set(best["cand"]["isbns"]) else "",
+    )
+    return best["result"]
 
 
 def _has_meaningful_authors(book):
