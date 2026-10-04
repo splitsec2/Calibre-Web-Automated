@@ -611,6 +611,20 @@ def _descriptions(session):
     return [o.text for o in session.added if hasattr(o, "text")]
 
 
+class TestIsbnLabels:
+    def test_edition_note_between_label_and_number(self):
+        found = be.find_labelled_isbns("ISBN (hardcover) 978-0-451-41844-9\nISBN [ebook]: 978-1-101-21198-4")
+        assert [(x["isbn"], x["kind"]) for x in found] == [("9780451418449", "print"), ("9781101211984", "ebook")]
+
+    def test_a_long_aside_is_not_an_edition_note(self):
+        assert be.find_labelled_isbns(
+            "ISBN (and a very long parenthetical that is not an edition note) 978-0-451-41844-9") == []
+
+    def test_kind_comes_from_the_isbns_own_label(self):
+        found = be.find_labelled_isbns("Hardcover ISBN 978-0-451-41844-9\neBook ISBN 978-1-101-21198-4")
+        assert [x["kind"] for x in found] == ["print", "ebook"]
+
+
 class TestIngest:
     def test_summary_record_tags_and_description_never_reach_the_book(self, monkeypatch, tmp_path):
         epub = _book_file(tmp_path / "b.epub", "Outgrowing God", "Richard Dawkins", words=72000)

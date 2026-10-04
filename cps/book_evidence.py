@@ -134,7 +134,10 @@ def normalize_isbn(text):
 
 _SEP = r"[\s\-‐-―.]"
 _ISBN_LABELLED = re.compile(
-    r"ISBN(?:[\s\-]?1[03])?(?P<gap>[^0-9A-Za-z]{0,25}?)"
+    r"ISBN(?:[\s\-]?1[03])?"
+    # an edition note between label and number: "ISBN (hardcover) 978-...", "ISBN [ebook]: 978-..."
+    r"(?P<note>\s*[\(\[][A-Za-z][A-Za-z .,/-]{0,28}[\)\]])?"
+    r"(?P<gap>[^0-9A-Za-z]{0,25}?)"
     r"(?P<num>97[89]" + _SEP + r"?(?:[0-9]" + _SEP + r"?){9}[0-9]|(?:[0-9]" + _SEP + r"?){9}[0-9Xx])(?![0-9])",
     re.I,
 )
@@ -165,11 +168,20 @@ def find_labelled_isbns(text):
         if not d13 or d13 in seen:
             continue
         seen.add(d13)
-        ctx = text[max(0, m.start() - 40): m.end() + 30]
+        # Kind from the closest text first: the label itself and its note, then the label's own
+        # line, then a window either side. A wide window alone tagged "Hardcover ISBN ..." as an
+        # ebook when "eBook ISBN ..." was printed on the next line.
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line = text[line_start: line_end if line_end != -1 else len(text)]
+        before = text[max(line_start, m.start() - 25): m.start()]
         kind = "unknown"
-        for name, rx in _KIND_WORDS:
-            if rx.search(ctx):
-                kind = name
+        for ctx in (before + m.group(0), line, text[max(0, m.start() - 40): m.end() + 30]):
+            for name, rx in _KIND_WORDS:
+                if rx.search(ctx):
+                    kind = name
+                    break
+            if kind != "unknown":
                 break
         out.append({"isbn": d13, "raw": raw.strip(), "kind": kind, "offset": m.start()})
     return out
