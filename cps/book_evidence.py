@@ -359,6 +359,11 @@ def _extract_epub(reader, probe_names=()):
     spine = [p for p in spine if p and p in reader.names]
     if not spine:
         raise EvidenceError("empty spine")
+    if "META-INF/encryption.xml" in reader.names:
+        enc = reader.read("META-INF/encryption.xml").decode("utf-8", "replace")
+        locked = {posixpath.normpath(urllib.parse.unquote(u)) for u in re.findall(r'CipherReference[^>]*URI="([^"]+)"', enc)}
+        if locked & set(spine):
+            raise EvidenceError("text is encrypted (DRM)")
 
     claims = _opf_claims(opf)
     texts, titles = [], []

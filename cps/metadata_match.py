@@ -211,6 +211,12 @@ def title_support(title, evidence):
         return 0.0
     if _phrase_in(key, hay):
         return 1.0
+    if "*" in (title or ""):
+        # 'F*ck' in the record, 'Fuck' in the book. A starred letter or three, inside one word.
+        starred = title_key((title or "").replace("*", "qxzq"))
+        pattern = re.escape(" " + starred + " ").replace("qxzq", "[a-z]{0,3}")
+        if "[a-z]" in pattern and re.search(pattern, hay):
+            return 1.0
     squashed = key.replace(" ", "")
     if len(squashed) >= 8 and re.search(r"[a-z]{3}", squashed) and squashed in hay.replace(" ", ""):
         return 0.9
@@ -224,7 +230,8 @@ def name_support(name, evidence):
     toks = _ntoks(name)
     if len(toks) < 2:
         return 0.0          # a single word ('Andrew', 'Jack') is printed everywhere; it proves nothing
-    if _phrase_in(" ".join(toks), hay) or _phrase_in(" ".join(toks[1:] + toks[:1]), hay):
+    if (_phrase_in(" ".join(toks), hay) or _phrase_in(" ".join(toks[1:] + toks[:1]), hay)
+            or _phrase_in(" ".join(toks[-1:] + toks[:-1]), hay)):
         return 1.0
     if len(toks) >= 2 and "".join(toks) in hay.replace(" ", "") and len("".join(toks)) >= 8:
         return 1.0

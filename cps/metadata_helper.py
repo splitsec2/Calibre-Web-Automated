@@ -731,6 +731,30 @@ def _is_junk_title(title):
     return bool(_ISBN_IN_TITLE.search(text) or metadata_match._FORMAT_JUNK.search(text))
 
 
+# A document <title> like "/cwa-book-ingest/new_1_20260823_060533_5" is a
+# temp path some conversion wrote, not a title. Its digits must not veto
+# anything.
+_PATH_LIKE_TITLE = re.compile(r"^\s*[/\\]|_\d{8}_\d{6}")
+
+
+def _book_title_claims(evidence):
+    """Titles the file claims for itself (OPF title, and the <title> most of its
+    pages carry), without temp paths."""
+    return [t for _, t in metadata_match.claim_titles(evidence) if not _PATH_LIKE_TITLE.search(t)]
+
+
+def _title_in_book(title, evidence):
+    """The title is printed on the title or copyright page, or it is the
+    <title> most of the book's own pages carry. Plenty of real books have an
+    image title page and a copyright page that never spells the title out."""
+    if metadata_match.title_support(title, evidence) >= metadata_match.PRINTED:
+        return True
+    doc_title = evidence.get("doc_title") or ""
+    return bool(doc_title) and (
+        metadata_match.title_similarity(title, metadata_match.clean_claim_title(doc_title))
+        >= metadata_match.TITLE_SIM_SAME)
+
+
 def _candidate_from_result(result):
     """The plain dict metadata_match works on, from a provider's MetaRecord."""
     isbns = []
@@ -754,6 +778,12 @@ def _candidate_from_result(result):
     }
 
 
+def _collection_markers(title):
+    """Box set / omnibus / summary / study guide markers in a title."""
+    return [r for r in metadata_match.junk_title_reasons(title or "")
+            if not r.startswith("marketing or audio-product text")]
+
+
 def _description_vetoes(description):
     """A summary product's record, whatever its title and author say."""
     text = (description or "")[:4000]
@@ -771,12 +801,17 @@ def _select_with_book_evidence(results, evidence, book_isbn, book_title=None, bo
       summary/guide/compilation titles, known summary publishers, an author
       the book never prints, a different volume number, a book that is itself
       a summary), and its description is not a summary's disclaimer
-    - its title is printed in the book's front matter or copyright page, and
-      one of its authors is printed there in full
+    - its title is printed in the book's front matter or copyright page (or is
+      the <title> of the book's own pages), and one of its authors is printed
+      on those pages in full
     - it passes the title/author gate against the book's record (NextGen
       #1164), unless the book proves it: one of its ISBNs is printed with an
-      ISBN label on the title or copyright pages. That is what lets an import
-      titled "0062288431 (N)" take the record for the book it is.
+      ISBN label on the title or copyright pages. Then only the main title has
+      to match (a subtitle may differ), and nothing has to match when the
+      record's title is junk. That is what lets an import titled
+      "0062288431 (N)" take the record for the book it is.
+    - if the file's own title says it is a box set, collection or summary,
+      the result has to say so too
 
     Every result is checked, then the survivors are ranked by how much of the
     book backs them, so a wrong record ranked first by the provider no longer
@@ -794,17 +829,32 @@ def _select_with_book_evidence(results, evidence, book_isbn, book_title=None, bo
         )
         target = None
 
+    book_titles = _book_title_claims(evidence)
+    # The record's title is junk, or the file's own title claim is (swapped
+    # fields: title "Lee Child", author "Die Trying (txt)").
+    junk_title = _is_junk_title(book_title) or bool(metadata_match.claim_junk(evidence)["title"])
+    # A file whose own title says it's a box set, a summary or a collection is
+    # that product. It often prints the first book's ISBN and title page, so a
+    # record for the single book would otherwise look proven.
+    file_is_product = any(_collection_markers(t) for t in [book_title or ""] + book_titles)
     ranked = []
     for index, result in enumerate(results):
         cand = _candidate_from_result(result)
-        score, vetoes, _ = metadata_match.assess_candidate(evidence, cand)
+        score, vetoes, _ = metadata_match.assess_candidate(evidence, cand, book_titles)
         vetoes = list(vetoes) + _description_vetoes(getattr(result, "description", ""))
-        if metadata_match.title_support(cand["title"], evidence) < metadata_match.PRINTED:
+        if not _title_in_book(cand["title"], evidence):
             vetoes.append("title %r is not printed in the book" % cand["title"])
         if metadata_match.author_support(cand["authors"], evidence) < 1.0:
             vetoes.append("no author of %s is printed in full in the book" % (cand["authors"][:3],))
+        if file_is_product and not _collection_markers(cand["title"]):
+            vetoes.append("the file's own title says it is a collection or summary, %r does not" % cand["title"])
         proven = bool(printed & set(cand["isbns"]))
         isbn_match = bool(target and target in cand["isbns"])
+        if proven and not junk_title and (
+                metadata_match.title_similarity(book_title or "", cand["title"]) < metadata_match.TITLE_SIM_SAME):
+            # The printed ISBN lets a subtitle differ ("The Selfish Gene" for
+            # "The Selfish Gene: 40th Anniversary Edition"), not the title.
+            vetoes.append("title %r is not the book's %r, ISBN or not" % (cand["title"], book_title))
         if not (proven or isbn_match):
             similarity = _title_similarity(book_title, cand["title"])
             if similarity < 1.0 and similarity < _TITLE_FUZZY_MATCH_MIN:

@@ -68,7 +68,7 @@ def _chapters(n_words, n=10):
     return [("Chapter %d" % (i + 1), "<h2>Chapter %d</h2><p>%s</p>" % (i + 1, _filler(per, i))) for i in range(n)]
 
 
-def _write_epub(path, title, creators, docs, isbns=(), entity=False):
+def _write_epub(path, title, creators, docs, isbns=(), entity=False, doc_title=None, encrypt=False):
     ids = "".join('<dc:identifier opf:scheme="ISBN">%s</dc:identifier>' % i for i in isbns)
     cr = "".join('<dc:creator opf:role="aut">%s</dc:creator>' % html.escape(c) for c in creators)
     items = "".join('<item id="d%d" href="text/d%d.xhtml" media-type="application/xhtml+xml"/>' % (k, k)
@@ -89,7 +89,14 @@ def _write_epub(path, title, creators, docs, isbns=(), entity=False):
         for k, (_, body) in enumerate(docs):
             z.writestr("OEBPS/text/d%d.xhtml" % k,
                        '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml">'
-                       '<head><title>%s</title></head><body>%s</body></html>' % (html.escape(title), body))
+                       '<head><title>%s</title></head><body>%s</body></html>'
+                       % (html.escape(title if doc_title is None else doc_title), body))
+        if encrypt:
+            # What Adobe DRM leaves: the chapters listed as encrypted, their bytes ciphertext.
+            refs = "".join('<EncryptedData><CipherData><CipherReference URI="OEBPS/text/d%d.xhtml"/></CipherData>'
+                           '</EncryptedData>' % k for k in range(len(docs)))
+            z.writestr("META-INF/encryption.xml", '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                       '%s</encryption>' % refs)
     return str(path)
 
 
@@ -309,10 +316,12 @@ class TestNothingAppliedWhenTheBookDoesNotBackIt:
         body_isbn = [i["isbn"] for i in ev["isbns_in_text"] if i.get("where") == "body"][0]
         other = _rec("Other Book", ["Ann Writer"], body_isbn)
         assert _pick(ev, [other], "Real Book", ["Ann Writer"]) is None
+        sequel = _rec("Real Book: The Sequel", ["Ann Writer"], body_isbn)
+        assert _pick(ev, [sequel], "Real Book", ["Ann Writer"]) is None
 
     def test_title_not_printed_in_the_book(self, tmp_path):
         docs = [("Copyright", "<p>Copyright © 2012 by Ann Writer. All rights reserved.</p>")] + _chapters(80000)
-        ev = _evidence(_write_epub(tmp_path / "b.epub", "Some Novel", ["Ann Writer"], docs))
+        ev = _evidence(_write_epub(tmp_path / "b.epub", "Some Novel", ["Ann Writer"], docs, doc_title=""))
         assert _pick(ev, [_rec("Some Novel", ["Ann Writer"])], "Some Novel", ["Ann Writer"]) is None
 
     def test_author_printed_only_by_surname(self, tmp_path):
@@ -346,6 +355,103 @@ class TestNothingAppliedWhenTheBookDoesNotBackIt:
         assert ev["summary_file"]
         assert _pick(ev, [_rec("Summary of Outgrowing God", ["Quick Reads"])], "Summary of Outgrowing God",
                      ["Quick Reads"]) is None
+
+
+class TestFoundOnARealLibrary:
+    """Real books the first version of this check rejected."""
+
+    def test_author_printed_surname_first(self, tmp_path):
+        tp = ("Title", "<h1>The Magician's Nephew</h1><p>by Lewis, C. S.</p>")
+        ev = _evidence(_write_epub(tmp_path / "b.epub", "The Magician's Nephew", ["C. S. Lewis"], [tp] + _chapters(42000)))
+        right = _rec("The Magician's Nephew", ["C. S. Lewis"])
+        assert _pick(ev, [right], "The Magician's Nephew", ["C. S. Lewis"]) is right
+
+    def test_censored_title_matches_the_uncensored_page(self, tmp_path):
+        tp = _title_page("The Subtle Art of Not Giving a Fuck", "Mark Manson")
+        ev = _evidence(_write_epub(tmp_path / "b.epub", "The Subtle Art of Not Giving a F*ck", ["Mark Manson"],
+                                   [tp] + _chapters(54000), doc_title=""))
+        right = _rec("The Subtle Art of Not Giving a F*ck", ["Mark Manson"])
+        assert _pick(ev, [right], "The Subtle Art of Not Giving a F*ck", ["Mark Manson"]) is right
+        other = _rec("The Subtle Art of Not Giving a D*mn", ["Mark Manson"])
+        assert _pick(ev, [other], "The Subtle Art of Not Giving a D*mn", ["Mark Manson"]) is None
+        across_words = _rec("The Subtle Art of N*ck", ["Mark Manson"])     # a star never spans words
+        assert mm.title_support(across_words.title, ev) < 0.9
+
+    def test_image_title_page_backed_by_the_pages_own_title(self, tmp_path):
+        """No title in the text, only in the <title> of every page."""
+        cp = ("Copyright", "<p>Copyright © 2019 by James Patterson. All rights reserved.</p>")
+        docs = [("Cover", '<img src="cover.jpg"/>'), cp] + _chapters(79000)
+        ev = _evidence(_write_epub(tmp_path / "b.epub", "Criss Cross", ["James Patterson"], docs))
+        right = _rec("Criss Cross", ["James Patterson"])
+        assert _pick(ev, [right], "Criss Cross", ["James Patterson"]) is right
+        other = _rec("Cross Kill", ["James Patterson"])
+        assert _pick(ev, [other], "Cross Kill", ["James Patterson"]) is None
+
+    def test_temp_path_page_title_backs_nothing_and_vetoes_nothing(self, tmp_path):
+        tp = _title_page("Fitness After 40", "Vonda Wright", "How to Stay Strong at Any Age")
+        cp = _copyright_page("Fitness After 40", "Vonda Wright")
+        ev = _evidence(_write_epub(tmp_path / "b.epub", "Fitness After 40", ["Vonda Wright"], [tp, cp] + _chapters(70000),
+                                   doc_title="/cwa-book-ingest/new_1_20260823_060533_5"))
+        right = _rec("Fitness After 40", ["Vonda Wright"])
+        assert _pick(ev, [right], "Fitness After 40", ["Vonda Wright"]) is right
+
+    def test_box_set_that_prints_the_first_books_isbn(self, tmp_path):
+        tp = _title_page("The Advocate", "Teresa Burrell")
+        cp = _copyright_page("The Advocate", "Teresa Burrell", [("ISBN", "978-1-938680-03-8")])
+        ev = _evidence(_write_epub(tmp_path / "b.epub", "The Advocate Series: Box Set", ["Teresa Burrell"],
+                                   [tp, cp] + _chapters(300000)))
+        first = _rec("The Advocate", ["Teresa Burrell"], "9781938680038")
+        assert _pick(ev, [first], "The Advocate Series: Box Set", ["Teresa Burrell"]) is None
+        boxed = _rec("The Advocate Series: Box Set", ["Teresa Burrell"])
+        tp2 = _title_page("The Advocate Series: Box Set", "Teresa Burrell")
+        ev2 = _evidence(_write_epub(tmp_path / "c.epub", "The Advocate Series: Box Set", ["Teresa Burrell"],
+                                    [tp2, tp, cp] + _chapters(300000)))
+        assert _pick(ev2, [first, boxed], "The Advocate Series: Box Set", ["Teresa Burrell"]) is boxed
+
+    def test_box_set_marker_in_brackets(self, tmp_path):
+        """Brackets are dropped before titles are compared, so only the marker
+        itself tells the box set from book 1."""
+        tp = _title_page("The Advocate", "Teresa Burrell")
+        cp = _copyright_page("The Advocate", "Teresa Burrell", [("ISBN", "978-1-938680-03-8")])
+        ev = _evidence(_write_epub(tmp_path / "b.epub", "The Advocate (Books 1-3 Box Set)", ["Teresa Burrell"],
+                                   [tp, cp] + _chapters(300000)))
+        first = _rec("The Advocate", ["Teresa Burrell"], "9781938680038")
+        assert m._select_metadata_result([first], None, book_title="The Advocate (Books 1-3 Box Set)",
+                                         book_authors=["Teresa Burrell"]) is first
+        assert _pick(ev, [first], "The Advocate (Books 1-3 Box Set)", ["Teresa Burrell"]) is None
+
+    def test_printed_isbn_does_not_let_a_shorter_title_in(self, tmp_path):
+        """A provider record titled 'Kill' with the ISBN of 'Kill Alex Cross'."""
+        ev = _evidence(_book_file(tmp_path / "b.epub", "Kill Alex Cross", "James Patterson", words=90000,
+                                  isbns_printed=[("ISBN", "978-1-84605-764-9")]))
+        truncated = _rec("Kill", ["James Patterson"], "9781846057649")
+        assert _pick(ev, [truncated], "Kill Alex Cross", ["James Patterson"]) is None
+        right = _rec("Kill Alex Cross", ["James Patterson"], "9781846057649")
+        assert _pick(ev, [truncated, right], "Kill Alex Cross", ["James Patterson"]) is right
+
+    def test_swapped_title_and_author_with_a_printed_isbn(self, tmp_path):
+        ev = _evidence(_book_file(tmp_path / "b.epub", "Die Trying", "Lee Child", words=137000, opf_title="Lee Child",
+                                  opf_creators=["Die Trying (txt)"], isbns_printed=[("ISBN", "978-0-593-04144-4")]))
+        right = _rec("Die Trying", ["Lee Child"], "9780593041444")
+        assert _pick(ev, [right], "Lee Child", ["Die Trying (txt)"]) is right
+        assert _pick(ev, [_rec("Die Trying", ["Lee Child"])], "Lee Child", ["Die Trying (txt)"]) is None
+
+    def test_drm_encrypted_epub_applies_nothing(self, monkeypatch, tmp_path):
+        epub = _write_epub(tmp_path / "b.epub", "The 22-Day Revolution", ["Marco Borges"],
+                           [_title_page("The 22-Day Revolution", "Marco Borges")] + _chapters(6000), encrypt=True)
+        assert _evidence(epub)["status"] == "insufficient"
+        provider = _Provider("google", [_rec("The 22-Day Revolution", ["Marco Borges"], tags=["Diet"])])
+        applied, book, _ = _ingest(monkeypatch, tmp_path, title="The 22-Day Revolution", authors=["Marco Borges"],
+                                   epub=epub, providers=[provider])
+        assert not applied and list(book.tags) == []
+
+    def test_obfuscated_fonts_are_not_drm(self, tmp_path):
+        epub = _write_epub(tmp_path / "b.epub", "Real Book", ["Ann Writer"],
+                           [_title_page("Real Book", "Ann Writer")] + _chapters(6000))
+        with zipfile.ZipFile(epub, "a") as z:
+            z.writestr("META-INF/encryption.xml", '<encryption><EncryptedData><CipherData>'
+                       '<CipherReference URI="OEBPS/fonts/a.otf"/></CipherData></EncryptedData></encryption>')
+        assert _evidence(epub)["status"] == "ok"
 
 
 class TestRealBooksStillMatch:
