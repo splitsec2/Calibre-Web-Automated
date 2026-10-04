@@ -273,6 +273,7 @@ class LibraryConverter:
         """
         decoder = json.JSONDecoder()
         first_error = None
+        empty_listing = None
         offset = 0
         for line in raw_output.splitlines(keepends=True):
             stripped = line.lstrip()
@@ -290,8 +291,17 @@ class LibraryConverter:
                         continue
                     surrounding = raw_output[:start] + "\n" + raw_output[end:]
                     diagnostics = [text.strip() for text in surrounding.splitlines() if text.strip()]
+                    if not document:
+                        # A stray "[]" line is as plausible as an empty library,
+                        # so keep looking and fall back to it only if no real
+                        # listing follows.
+                        empty_listing = empty_listing or (document, diagnostics)
+                        offset += len(line)
+                        continue
                     return document, diagnostics
             offset += len(line)
+        if empty_listing is not None:
+            return empty_listing
         raise first_error or json.JSONDecodeError("No book list in calibredb output", raw_output, 0)
 
 
