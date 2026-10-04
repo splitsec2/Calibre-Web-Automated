@@ -1035,7 +1035,11 @@ $(function() {
             // with check_read_formats() in cps/helper.py and read_book() in cps/web.py;
             // any other format falls through read_book()'s final else and redirects to
             // the index with "Oops! Selected book is unavailable."
-            var readableFormats = ['epub', 'kepub', 'pdf', 'txt', 'cbz', 'cbt', 'cbr', 'djvu', 'djv'];
+            // The audio formats are last: read_book() opens them in the audio player
+            // (EXTENSIONS_AUDIO in cps/constants.py), so an audiobook-only book keeps
+            // its quick-read action.
+            var readableFormats = ['epub', 'kepub', 'pdf', 'txt', 'cbz', 'cbt', 'cbr', 'djvu', 'djv',
+                                   'mp3', 'mp4', 'ogg', 'opus', 'wav', 'flac', 'm4a', 'm4b'];
             var selectedFormat = null;
             
             for (var i = 0; i < readableFormats.length; i++) {
