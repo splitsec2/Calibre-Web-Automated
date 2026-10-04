@@ -88,3 +88,20 @@ class TestUnknownAuthorPlaceholder:
             [_cand("Cross", ["Al Ewing"])], None,
             book_title="Cross", book_authors=[NS(name="James Patterson")],
         ) is None
+
+
+class TestOrdinalsAndYearsAreNotVolumes:
+    def test_ordinal_in_an_edition_name_is_not_a_volume_number(self):
+        # "60th" is not a bare number, so it adds nothing to the number set
+        assert m._title_numbers("Fahrenheit 451: 60th Anniversary Edition") == {451}
+        assert not m._volume_numbers_conflict(
+            "Fahrenheit 451", "Fahrenheit 451: 60th Anniversary Edition")
+
+    def test_hyphenated_number_title_still_matches_itself(self):
+        assert m._title_similarity(
+            "Catch-22", "Catch-22 (50th Anniversary Edition)") == 1.0
+
+    def test_a_year_in_a_title_still_tells_volumes_apart(self):
+        assert m._volume_numbers_conflict(
+            "The Best American Short Stories 2019",
+            "The Best American Short Stories 2020")
