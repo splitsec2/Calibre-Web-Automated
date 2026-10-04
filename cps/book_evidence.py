@@ -55,7 +55,7 @@ NS = {
 EVIDENCE_KEYS = (
     "status", "reason", "format", "claims", "isbns_in_text", "disclaimers", "words", "chapters",
     "spine_docs", "language", "english_ratio", "front_norm", "copyright_norm", "doc_title",
-    "summary_file", "publisher_lines", "name_hits",
+    "summary_file", "publisher_lines", "name_hits", "drm",
 )
 
 
@@ -342,6 +342,11 @@ def extract_epub(path_or_file, probe_names=()):
         zf.close()
 
 
+# Files DRM schemes leave in META-INF, used to name the scheme in the log.
+_DRM_MARKERS = (("META-INF/rights.xml", "adobe-adept"), ("META-INF/sinf.xml", "apple-fairplay"),
+                ("META-INF/license.lcpl", "readium-lcp"))
+
+
 def _extract_epub(reader, probe_names=()):
     container = _safe_xml(reader.read("META-INF/container.xml"))
     root = container.find(".//c:rootfile", NS)
@@ -363,7 +368,13 @@ def _extract_epub(reader, probe_names=()):
         enc = reader.read("META-INF/encryption.xml").decode("utf-8", "replace")
         locked = {posixpath.normpath(urllib.parse.unquote(u)) for u in re.findall(r'CipherReference[^>]*URI="([^"]+)"', enc)}
         if locked & set(spine):
-            raise EvidenceError("text is encrypted (DRM)")
+            # The book's text is encrypted (obfuscated fonts are never in the spine). A partly
+            # encrypted book can still yield a few thousand plain words, so this is decided
+            # here, before any text is read, not from the word count.
+            scheme = next((name for marker, name in _DRM_MARKERS if marker in reader.names), "unknown")
+            out = _insufficient("epub", "text is encrypted (DRM, %s)" % scheme)
+            out.update(status="drm", drm={"scheme": scheme, "encrypted": len(locked & set(spine))})
+            return out
 
     claims = _opf_claims(opf)
     texts, titles = [], []
@@ -436,6 +447,7 @@ def _extract_epub(reader, probe_names=()):
         "summary_file": summary_file,
         "publisher_lines": publisher_lines,
         "name_hits": name_hits(norm_text(body), probe_names),
+        "drm": None,
     }
 
 
@@ -445,7 +457,7 @@ def _insufficient(fmt, reason):
                        "series": None, "series_index": None},
             "isbns_in_text": [], "disclaimers": [], "words": None, "chapters": None, "spine_docs": None,
             "language": "", "english_ratio": None, "front_norm": "", "copyright_norm": "", "doc_title": "",
-            "summary_file": False, "publisher_lines": [], "name_hits": {}}
+            "summary_file": False, "publisher_lines": [], "name_hits": {}, "drm": None}
 
 
 # What other formats could give, and why v1 does not guess:

@@ -692,14 +692,20 @@ def _read_book_evidence(book):
       "evidence": check every result against ``evidence``
       "gate":     no EPUB (or an image-only one): the title/author gate alone,
                   exactly as before
-      "skip":     the EPUB is there but can't be read, or the check failed:
-                  apply nothing
+      "skip":     the EPUB is there but can't be read (including DRM-protected
+                  ones, which are also logged as a warning), or the check
+                  failed: apply nothing
     """
     try:
         path, why = _book_epub_path(book)
         if not path:
             return "gate", None, why
         evidence = book_evidence.extract(path)
+        if evidence.get("status") == "drm":
+            log.warning(f"Book {getattr(book, 'id', '?')} ({getattr(book, 'title', '')}) is a DRM-protected EPUB "
+                        f"({evidence['drm']['scheme']}). Its text can't be read here or by most readers; remove it "
+                        f"and add a DRM-free copy.")
+            return "skip", None, "its EPUB is DRM-protected (%s), so nothing can be checked" % evidence["drm"]["scheme"]
         if evidence.get("status") != "ok":
             return "skip", None, "its EPUB could not be read (%s), so nothing can be checked" % evidence.get("reason")
         words = evidence.get("words") or 0
