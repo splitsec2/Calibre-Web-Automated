@@ -226,12 +226,13 @@ class TestGapsInTheTitleAuthorGate:
         assert _pick(ev, [wrong, right], "The Secret", ["Lee Child"]) is right
 
     def test_next_volume_in_a_series(self, tmp_path):
-        """'Night Shift 2' vs 'Night Shift 3' is 0.92 similar, which clears the bar."""
+        """'Night Shift 2' vs 'Night Shift 3' is 0.92 similar as text. #1589's volume-number
+        check now rejects it on its own; the in-book check still agrees."""
         tp = ("Title", "<h1>Night Shift 2</h1><p>Ann Writer</p><p>Also by Ann Writer: Night Shift 3</p>")
         ev = _evidence(_write_epub(tmp_path / "b.epub", "Night Shift 2", ["Ann Writer"], [tp] + _chapters(60000)))
         next_one = _rec("Night Shift 3", ["Ann Writer"])
         assert m._select_metadata_result([next_one], None, book_title="Night Shift 2",
-                                         book_authors=["Ann Writer"]) is next_one
+                                         book_authors=["Ann Writer"]) is None
         assert _pick(ev, [next_one], "Night Shift 2", ["Ann Writer"]) is None
         right = _rec("Night Shift 2", ["Ann Writer"])
         assert _pick(ev, [next_one, right], "Night Shift 2", ["Ann Writer"]) is right
@@ -439,11 +440,26 @@ class TestFoundOnARealLibrary:
     def test_drm_encrypted_epub_applies_nothing(self, monkeypatch, tmp_path):
         epub = _write_epub(tmp_path / "b.epub", "The 22-Day Revolution", ["Marco Borges"],
                            [_title_page("The 22-Day Revolution", "Marco Borges")] + _chapters(6000), encrypt=True)
-        assert _evidence(epub)["status"] == "insufficient"
+        ev = _evidence(epub)
+        assert ev["status"] == "drm" and ev["drm"]["encrypted"] > 0
         provider = _Provider("google", [_rec("The 22-Day Revolution", ["Marco Borges"], tags=["Diet"])])
         applied, book, _ = _ingest(monkeypatch, tmp_path, title="The 22-Day Revolution", authors=["Marco Borges"],
                                    epub=epub, providers=[provider])
         assert not applied and list(book.tags) == []
+
+    def test_drm_names_the_scheme_and_logs_a_warning(self, monkeypatch, tmp_path, caplog):
+        epub = _write_epub(tmp_path / "b.epub", "The 22-Day Revolution", ["Marco Borges"],
+                           [_title_page("The 22-Day Revolution", "Marco Borges")] + _chapters(6000), encrypt=True)
+        with zipfile.ZipFile(epub, "a") as z:
+            z.writestr("META-INF/rights.xml", "<rights/>")
+        assert _evidence(epub)["drm"]["scheme"] == "adobe-adept"
+        warned = []
+        monkeypatch.setattr(m.log, "warning", lambda msg, *a, **k: warned.append(str(msg)))
+        provider = _Provider("google", [_rec("The 22-Day Revolution", ["Marco Borges"])])
+        applied, _, _ = _ingest(monkeypatch, tmp_path, title="The 22-Day Revolution", authors=["Marco Borges"],
+                                epub=epub, providers=[provider])
+        assert not applied
+        assert any("DRM-protected" in w and "adobe-adept" in w for w in warned), warned
 
     def test_obfuscated_fonts_are_not_drm(self, tmp_path):
         epub = _write_epub(tmp_path / "b.epub", "Real Book", ["Ann Writer"],
