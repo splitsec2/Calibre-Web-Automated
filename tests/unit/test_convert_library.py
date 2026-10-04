@@ -253,3 +253,15 @@ def test_output_with_no_book_list_is_still_reported_unparseable(convert_library,
     converter = _converter_with_fake_calibredb(convert_library, tmp_path, WARNING + "\n")
     assert converter.get_library_book_formats() == {}
     assert any("Failed to parse calibredb command output" in line for line in log_lines)
+
+
+def test_a_stray_empty_list_before_the_json_is_not_taken_for_an_empty_library(convert_library, tmp_path, log_lines):
+    stdout_text = "[]\n" + json.dumps(BOOKS, indent=2) + "\n"
+    converter = _converter_with_fake_calibredb(convert_library, tmp_path, stdout_text)
+    assert converter.get_library_book_formats() == EXPECTED
+
+
+def test_a_genuinely_empty_library_still_reads_as_empty(convert_library, tmp_path, log_lines):
+    converter = _converter_with_fake_calibredb(convert_library, tmp_path, "[]\n")
+    assert converter.get_library_book_formats() == {}
+    assert not any("Failed to parse calibredb command output" in line for line in log_lines)
