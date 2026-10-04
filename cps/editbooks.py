@@ -37,6 +37,7 @@ from .cwa_functions import get_ingest_dir
 from .usermanagement import user_login_required, login_required_if_no_ano
 from .string_helper import strip_whitespaces
 from .metadata_change_log import write_metadata_change_log
+from . import tag_management
 from werkzeug.utils import secure_filename
 import uuid
 
@@ -232,6 +233,20 @@ def table_get_custom_enum(c_id):
 def edit_list_book(param):
     vals = request.form.to_dict()
     return edit_book_param(param, vals)
+
+@editbook.route("/ajax/tag/<int:tag_id>/rename", methods=['POST'])
+@user_login_required
+@edit_required
+def rename_tag(tag_id):
+    return tag_management.rename_tag(tag_id)
+
+
+@editbook.route("/ajax/tag/<int:tag_id>/delete", methods=['POST'])
+@user_login_required
+@edit_required
+def delete_tag(tag_id):
+    return tag_management.delete_tag(tag_id)
+
 
 @editbook.route("/ajax/editselectedbooks", methods=['POST'])
 @login_required_if_no_ano
