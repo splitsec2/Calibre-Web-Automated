@@ -344,7 +344,7 @@ def test_private_tmp_dir_sits_beside_the_shared_one(convert_library, tmp_path, m
     private = Path(convert_library.make_private_tmp_dir(str(shared) + "/"))
     assert private.is_dir()
     assert private.parent == tmp_path
-    assert private.name.startswith(convert_library.PRIVATE_TMP_PREFIX)
+    assert private.name.startswith(f"{convert_library.PRIVATE_TMP_PREFIX}{os.getpid()}_")
     assert registered and registered[0][1] == str(private), "the dir is removed when the run exits"
 
     # what the ingest processor does at the end of every run
@@ -365,6 +365,27 @@ def test_leftovers_from_killed_runs_are_removed(convert_library, tmp_path, monke
     convert_library.make_private_tmp_dir(str(unrelated) + "/")
     assert not leftover.exists()
     assert (unrelated / "ingest.epub").exists(), "the shared dir belongs to ingest"
+
+
+def test_private_tmp_dir_falls_back_when_the_parent_is_not_writable(convert_library, tmp_path, monkeypatch):
+    """A tmp conversion dir mounted at /cwa-tmp has "/" as its parent, which isn't writable."""
+    monkeypatch.setattr(convert_library.atexit, "register", lambda *a: None)
+    system_tmp = tmp_path / "systmp"
+    system_tmp.mkdir()
+    monkeypatch.setattr(convert_library.tempfile, "gettempdir", lambda: str(system_tmp))
+    real_mkdtemp = convert_library.tempfile.mkdtemp
+    beside = tmp_path / "locked"
+    beside.mkdir()
+
+    def mkdtemp(prefix=None, dir=None):
+        if dir == str(beside):
+            raise PermissionError(13, "Permission denied", dir)
+        return real_mkdtemp(prefix=prefix, dir=dir)
+
+    monkeypatch.setattr(convert_library.tempfile, "mkdtemp", mkdtemp)
+    private = Path(convert_library.make_private_tmp_dir(str(beside / "shared") + "/"))
+    assert private.is_dir()
+    assert private.parent == system_tmp
 
 
 def test_remove_lock_only_removes_our_own_lock(convert_library, tmp_path):
