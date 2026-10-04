@@ -425,6 +425,54 @@ def _title_content_words(value):
                  if w not in _TITLE_STOPWORDS)
 
 
+# Words that announce a volume number. A roman numeral or number word is only
+# read as a number straight after one of these ("Part I", "Book Two"), because
+# "I" and "one" are ordinary words everywhere else.
+_VOLUME_MARKERS = frozenset((
+    "vol", "volume", "part", "pt", "book", "bk", "no", "number", "issue",
+    "episode", "season", "chapter", "tome",
+))
+
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+
+_ROMAN_NUMERALS = {
+    "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8,
+    "ix": 9, "x": 10, "xi": 11, "xii": 12, "xiii": 13, "xiv": 14, "xv": 15,
+    "xvi": 16, "xvii": 17, "xviii": 18, "xix": 19, "xx": 20,
+}
+
+
+def _title_numbers(value):
+    """Volume-like numbers in a title, as a set of ints (digits anywhere, plus
+    roman numerals and number words right after a marker such as "vol" or
+    "part")."""
+    words = _normalize_title(value).split()
+    numbers = set()
+    for i, word in enumerate(words):
+        if word.isdigit():
+            numbers.add(int(word))
+        elif i and words[i - 1] in _VOLUME_MARKERS:
+            if word in _NUMBER_WORDS:
+                numbers.add(_NUMBER_WORDS[word])
+            elif word in _ROMAN_NUMERALS:
+                numbers.add(_ROMAN_NUMERALS[word])
+    return numbers
+
+
+def _volume_numbers_conflict(left, right):
+    """True when both titles carry volume numbers and they are not the same.
+    "One Piece, Vol. 12" and "Vol. 13" are 0.94 similar as text but are
+    different books, and the author is the same. A title with no number on one
+    side is left to the other checks."""
+    a, b = _title_numbers(left), _title_numbers(right)
+    return bool(a and b and a != b)
+
+
 def _title_similarity(left, right):
     """0.0-1.0 similarity of two titles after normalization (NextGen #1164).
 
@@ -441,7 +489,12 @@ def _title_similarity(left, right):
     words_a, words_b = _title_content_words(left), _title_content_words(right)
     if words_a and words_a == words_b:
         return 1.0
+    if _volume_numbers_conflict(left, right):
+        return 0.0
     return SequenceMatcher(None, a, b).ratio()
+
+
+_PLACEHOLDER_AUTHORS = frozenset(("", "unknown"))
 
 
 def _author_name_tokens(authors):
@@ -463,6 +516,11 @@ def _author_name_tokens(authors):
     tokens = set()
     for author in (authors or []):
         name = author if isinstance(author, str) else getattr(author, "name", "")
+        # Calibre's "Unknown" placeholder is not a name, same rule as
+        # _has_meaningful_authors. Counting it would make a book with no real
+        # author reject every candidate.
+        if (name or "").strip().lower() in _PLACEHOLDER_AUTHORS:
+            continue
         tokens.update(w for w in _normalize_title(name).split() if len(w) > 2)
     return tokens
 
