@@ -36,6 +36,7 @@ from .file_helper import validate_mime_type
 from .cwa_functions import get_ingest_dir
 from .usermanagement import user_login_required, login_required_if_no_ano
 from .string_helper import strip_whitespaces
+from .metadata_change_log import write_metadata_change_log
 from werkzeug.utils import secure_filename
 import uuid
 
@@ -337,23 +338,7 @@ def edit_selected_books():
                 continue
 
             if metadata_changed and log_payload:
-                try:
-                    log_payload.setdefault('title', book.title)
-                    log_payload.setdefault('authors', ' & '.join([a.name for a in book.authors]))
-                    log_payload['_cwa_meta'] = {
-                        'modify_date': True,
-                        'change_count': len([k for k in log_payload.keys() if not k.startswith('_')]),
-                        'has_content': any(v != '' for k, v in log_payload.items() if not k.startswith('_')),
-                        'timestamp': datetime.now().isoformat()
-                    }
-
-                    now = datetime.now()
-                    log_path = f'/app/calibre-web-automated/metadata_change_logs/{now.strftime("%Y%m%d%H%M%S")}-{book.id}.json'
-                    with open(log_path, 'w', encoding='utf-8') as f:
-                        json.dump(log_payload, f, indent=4, ensure_ascii=False)
-                    log.debug(f"Created metadata change log for book {book.id} with changes: {list(log_payload.keys())}")
-                except Exception as e:
-                    log.error_or_exception(f"Failed to write metadata change log for book {book.id}: {e}")
+                write_metadata_change_log(book, log_payload)
 
         return json.dumps({'success': True})
     return ""
